@@ -34,6 +34,9 @@ class Agent(BaseAgent):
             except Exception as e:
                 logger.warning(f"Could not restore thread: {e}")
 
+        # Restore customer ID if available
+        self._customer_id = state_store.get("customer_id")
+
         self._conversation_history: list[str] = []
         self._orchestration: GroupChatOrchestration | None = None
 
@@ -44,7 +47,7 @@ class Agent(BaseAgent):
         self._mcp_plugin = MCPStreamableHttpPlugin(
             name="ContosoMCP",
             description="Contoso MCP Plugin",
-            url="http://localhost:8000/mcp",
+            url=self.mcp_server_uri,
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
@@ -57,10 +60,8 @@ class Agent(BaseAgent):
             instructions=(
                 "You are a helpful assistant. Use the available MCP tools to find info and answer questions. "
                 "You send your response to the secondary agent for review before replying to the user."
-                "If there was context from previous turns such as customer ID, include it to find best answer in your response."
-                "If you couldn't find customer ID from previous context, and the response from secondary agent is not sure about it, **ONLY THEN** ask user to provide it."
-                "Again don't assume ID, only pay close attention to previous chat context and secondary agent's response to see if user provided it"
-                "You only ask the user to provide ID, if none of the conversation context with user or secondary has it."
+                "Again **DON'T** assume ID, only pay close attention to previous chat context and secondary agent's response to see if user provided it"
+                "If unsure of the customer ID, **ALWAYS ASK NEVER ASSUME**"
                 "Respond to the user whatever was final answer from the secondary agent."
             ),
             plugins=[self._mcp_plugin],
@@ -72,10 +73,9 @@ class Agent(BaseAgent):
             description="You are a supervisor assistant who the primary agent reports to before answering user",
             instructions=(
                 "Make sure you double check the primary agent's response for accuracy and completeness, you can provide improvement feedback if needed."
-                "If you are not sure of customer ID, use the one from primary agent's response."
-                "Ask clarifying questions if the user is not clear, like if unsure about customer ID, see if primary agent used any ID to answer the question first time, if yes use that ID."
-                "If primary agent also has been unsure and you can't find it either from previous context **ONLY THEN** ask user to provide it."
+                "If NOT, **YOU MUST ASK** user to provide it."
                 "After reviewing, suggest the primary response what to answer to the user finally and include details on specifics such as invoice, bill, refund, etc promotion offers."
+                "If unsure of the customer ID, **ALWAYS ASK NEVER ASSUME**"
             ),
             plugins=[self._mcp_plugin],
         )
@@ -95,6 +95,17 @@ class Agent(BaseAgent):
 
     async def chat_async(self, user_input: str) -> str:
         await self.setup_agents()
+
+        # Extract customer ID if present in user input
+        import re
+        match = re.search(r"customer\s*id[:\s]*([0-9]+)", user_input, re.IGNORECASE)
+        if match:
+            self._customer_id = match.group(1)
+            self.state_store["customer_id"] = self._customer_id
+
+        # Optionally, prepend customer ID to user input if known and not present
+        if self._customer_id and "customer id" not in user_input.lower():
+            user_input = f"Customer ID: {self._customer_id}\n{user_input}"
 
         # Pass user input and persistent thread to the agent
         response = await self._agents[0].get_response(messages=user_input, thread=self._thread)
