@@ -26,7 +26,6 @@ class Agent(BaseAgent):
 
         # Keys scoped by session_id to isolate data per user/session
         self.thread_key = f"{session_id}_thread"
-        self.customer_key = f"{session_id}_customer_id"
         self.chat_history_key = f"{session_id}_chat_history"
 
         # Restore state from persistent store
@@ -36,7 +35,6 @@ class Agent(BaseAgent):
             valid_keys = inspect.signature(ChatHistoryAgentThread).parameters.keys()
             filtered = {k: v for k, v in self._thread.items() if k in valid_keys}
             self._thread = ChatHistoryAgentThread(**filtered)
-        self._customer_id: str | None = self.state_store.get(self.customer_key)
         self._conversation_history: list[dict] = self.state_store.get(self.chat_history_key, [])
 
         self._agents = None
@@ -62,11 +60,12 @@ class Agent(BaseAgent):
             name="PrimaryAgent",
             description="You are a helpful assistant answering customer questions for internet provider Contosso.",
             instructions=(
-                "You are a helpful assistant. Use the available MCP tools to find info and answer questions. "
-                "You send your response to the secondary agent for review before replying to the user. "
-                "Again **DON'T** assume ID, only pay close attention to previous chat context and secondary agent's response to see if user provided it. "
-                "If unsure of the customer ID, **ALWAYS ASK NEVER ASSUME**. "
-                "Respond to the user whatever was final answer from the secondary agent."
+                "You are a helpful assistant. You can use multiple tools to find information and answer questions. "
+                "Review the tools available to you and use them as needed. You can also ask clarifying questions if the user is not clear. "
+                "If the user input is just an ID or feels incomplete as a question, **ALWAYS** review previous communication in the same session and **INFER** the user's intent based on the **most recent prior question or context—regardless of the topic (bill, promotions, security, etc.). "
+                "For example, if the previous user question was about a bill, promotions, or security, and the user now provides an ID, assume they want information or action related to that topic for the provided ID. "
+                "Be proactive in connecting the current input to the user's previous requests and always retain and use the previous context to inform your response. "
+                "Provide the Secondary agent with both the complete context of the question (user query + previous history from the same session) and your answer for review."
             ),
             plugins=[self._mcp_plugin],
         )
@@ -76,10 +75,7 @@ class Agent(BaseAgent):
             name="SecondaryAgent",
             description="You are a supervisor assistant who the primary agent reports to before answering user",
             instructions=(
-                "Make sure you double check the primary agent's response for accuracy and completeness, you can provide improvement feedback if needed. "
-                "If NOT, **YOU MUST ASK** user to provide it. "
-                "After reviewing, suggest the primary response what to answer to the user finally and include details on specifics such as invoice, bill, refund, promotion offers, etc. "
-                "If unsure of the customer ID, **ALWAYS ASK NEVER ASSUME**."
+                "Provide constructive feedback. Respond with 'APPROVE' when your feedbacks are addressed."
             ),
             plugins=[self._mcp_plugin],
         )
@@ -98,20 +94,18 @@ class Agent(BaseAgent):
             )
 
     async def chat_async(self, user_input: str) -> str:
+        logger.info(f"[Session ID: {self.session_id}] Received user input: {user_input}")
         await self.setup_agents()
 
-        # Extract customer ID from input and persist
-        match = re.search(r"customer\s*id[:\s]*([0-9]+)", user_input, re.IGNORECASE)
-        if match:
-            self._customer_id = match.group(1)
-            self.state_store[self.customer_key] = self._customer_id
+        # Prepare full conversation history for the agent
+        from semantic_kernel.contents import ChatMessageContent
+        messages = []
+        for msg in self._conversation_history:
+            messages.append(ChatMessageContent(role=msg["role"], content=msg["content"]))
+        messages.append(ChatMessageContent(role="user", content=user_input))
 
-        # Prepend customer ID if known and not already present in input
-        if self._customer_id and "customer id" not in user_input.lower():
-            user_input = f"Customer ID: {self._customer_id}\n{user_input}"
-
-        # Get response from primary agent, passing persistent thread
-        response = await self._agents[0].get_response(messages=user_input, thread=self._thread)
+        # Get response from primary agent, passing full conversation history and persistent thread
+        response = await self._agents[0].get_response(messages=messages, thread=self._thread)
 
         # Update thread and persist
         self._thread = response.thread
@@ -127,4 +121,5 @@ class Agent(BaseAgent):
         ])
         self.state_store[self.chat_history_key] = self._conversation_history
 
+        logger.info(f"[Session ID: {self.session_id}] Responded with: {response_content}")
         return response_content
