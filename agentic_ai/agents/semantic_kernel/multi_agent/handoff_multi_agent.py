@@ -3,8 +3,8 @@ import logging
 from agents.base_agent import BaseAgent
 from semantic_kernel.agents import ChatCompletionAgent, ChatHistoryAgentThread
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
-from semantic_kernel.connectors.mcp import MCPSsePlugin
-
+from semantic_kernel.connectors.mcp import MCPStreamableHttpPlugin
+from fastapi.encoders import jsonable_encoder
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -17,6 +17,16 @@ class Agent(BaseAgent):
         super().__init__(state_store, session_id)
         self._agent = None
         self._initialized = False
+        self.thread_key = f"{session_id}_thread"
+        self.chat_history_key = f"{session_id}_chat_history"
+        # Restore state from persistent store
+        import inspect
+        self._thread = self.state_store.get(self.thread_key)
+        if isinstance(self._thread, dict):
+            valid_keys = inspect.signature(ChatHistoryAgentThread).parameters.keys()
+            filtered = {k: v for k, v in self._thread.items() if k in valid_keys}
+            self._thread = ChatHistoryAgentThread(**filtered)
+        self._conversation_history: list[dict] = self.state_store.get(self.chat_history_key, [])
 
     async def _setup_agents(self) -> None:
         """Initialize the assistant and tools only once."""
@@ -31,7 +41,7 @@ class Agent(BaseAgent):
         )
 
         # Set up the SSE plugin for the MCP service.
-        contoso_plugin = MCPSsePlugin(
+        contoso_plugin = MCPStreamableHttpPlugin(
             name="ContosoMCP",
             description="Contoso MCP Plugin",
             url=self.mcp_server_uri,
@@ -110,21 +120,32 @@ class Agent(BaseAgent):
 
         self._initialized = True
 
-    async def chat_async(self, prompt: str) -> str:
-        # Ensure agent/tools are ready and process the prompt.
+    async def chat_async(self, user_input: str) -> str:
+        logger.info(f"[Session ID: {self.session_id}] Received user input: {user_input}")
         await self._setup_agents()
 
-        response = await self._agent.get_response(messages=prompt, thread=self._thread)
+        # Prepare full conversation history for the agent
+        from semantic_kernel.contents import ChatMessageContent
+        messages = []
+        for msg in self._conversation_history:
+            messages.append(ChatMessageContent(role=msg["role"], content=msg["content"]))
+        messages.append(ChatMessageContent(role="user", content=user_input))
+
+        # Get response from main agent, passing full conversation history and persistent thread
+        response = await self._agent.get_response(messages=messages, thread=self._thread)
         response_content = str(response.content)
 
+        # Update thread and persist
         self._thread = response.thread
         if self._thread:
-            self._setstate({"thread": self._thread})
+            self.state_store[self.thread_key] = jsonable_encoder(self._thread)
 
-        messages = [
-            {"role": "user", "content": prompt},
+        # Update and persist conversation history for UI
+        self._conversation_history.extend([
+            {"role": "user", "content": user_input},
             {"role": "assistant", "content": response_content},
-        ]
-        self.append_to_chat_history(messages)
+        ])
+        self.state_store[self.chat_history_key] = self._conversation_history
 
+        logger.info(f"[Session ID: {self.session_id}] Responded with: {response_content}")
         return response_content
